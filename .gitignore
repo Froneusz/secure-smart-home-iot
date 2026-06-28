@@ -1,0 +1,30 @@
+# Certyfikaty TLS
+*.pem
+*.key
+*.crt
+
+# Sekrety i konfiguracja lokalna
+.env
+secrets.py
+config_local.py
+
+# Logi
+logi/
+*.log
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Edytory
+.vscode/
+.idea/
+*.swp
