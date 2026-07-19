@@ -1,0 +1,7 @@
+# Sekrety TLS — generowane lokalnie na RPi przez gen_cert.sh. NIE commitowac!
+cert.pem
+key.pem
+
+# Logi runtime (start.sh -> ~/Desktop/logi/)
+logi/
+*.log

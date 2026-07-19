@@ -50,9 +50,9 @@ TOPIK_SECURITY_ONLINE = "/plytka_antywlamaniowa/online"
 TOPIK_ENV_DANE        = "/plytka_srodowiskoa/zaszyfrowane"
 TOPIK_ENV_ONLINE      = "/plytka_srodowiskoa/online"
 
-# Blockchain rate limiting — TX tylko co N wiadomosc (Ganache na RPi jest zasobozerne)
-_BLOCKCHAIN_CO_ILE = 10
-_licznik_wiadomosci: dict[str, int] = {"security": 0, "environment": 0}
+# Kazda wiadomosc jest haszowana i zapisywana na blockchain (bez rate limitingu).
+# Jesli Ganache na RPi zacznie sie dlawic (sprawdz `free -h` / journalctl -u iot-ganache),
+# mozna przywrocic limitowanie: TX tylko co N-ta wiadomosc per urzadzenie.
 
 NAZWY_ALGORYTMOW: dict[int, str] = {
     0: "Czysty tekst",
@@ -404,10 +404,8 @@ def przy_wiadomosci(klient, _ud, wiadomosc) -> None:
         # SHA-256 odszyfrowanych danych
         data_hash = hashlib.sha256(odszyfrowane).hexdigest()
 
-        # Blockchain rate limiting — TX co _BLOCKCHAIN_CO_ILE wiadomosci (ochrona RAM na RPi)
-        _licznik_wiadomosci[urzadzenie] = _licznik_wiadomosci.get(urzadzenie, 0) + 1
-        wyslij_tx = (_licznik_wiadomosci[urzadzenie] % _BLOCKCHAIN_CO_ILE == 1)
-        tx_hash = zapisz_na_blockchain(data_hash) if wyslij_tx else ""
+        # Kazda wiadomosc trafia na blockchain (Ganache) — pelne pokrycie dla integralnosci danych
+        tx_hash = zapisz_na_blockchain(data_hash)
 
         # Arduino String(NaN) emituje literał "nan" — nieprawidlowy JSON; zamieniamy na 0
         tekst_json_clean = re.sub(r':\s*nan\b', ':0', tekst_json)

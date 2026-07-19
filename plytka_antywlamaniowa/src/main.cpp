@@ -11,523 +11,662 @@
 #include <base64.h>
 #include "mbedtls/aes.h"
 #include "mbedtls/gcm.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 
-// =======================================================
-// WYBOR ALGORYTMU SZYFROWANIA
-// 0 = Czysty tekst     1 = Base64      2 = Szyfr Cezara
-// 3 = XOR (klucz "1234")   4 = Vigenere ("TAJNE")
-// 5 = RC4              6 = AES-128-ECB 7 = AES-128-CBC
-// 8 = AES-128-GCM (uwierzytelnione, tag 16B na koncu)
-// Mozna zmienic przez MQTT: wyslij cyfre 0-8 na topicSetAlgorytm
-// =======================================================
-int WYBRANY_ALGORYTM = 0;
+volatile int wybranyAlgorytm = 0;
 
-// --- KONFIGURACJA SIECI ---
-const char* ssid       = "TWOJE_SSID";          // <-- uzupelnij przed flashowaniem
-const char* hasloWifi  = "TWOJE_HASLO_WIFI";    // <-- uzupelnij przed flashowaniem
-const char* serwerMqtt = "IP_RASPBERRY_PI";     // <-- adres IP Raspberry Pi w sieci lokalnej
-const char* topicAlarm      = "/plytka_antywlamaniowa/zaszyfrowane";
-const char* topicOnline     = "/plytka_antywlamaniowa/online";
-const char* topicSetAlgorytm = "/plytka_antywlamaniowa/set_algorytm";  // odbiór: "0"–"8"
+const char* ssid       = "TWOJE_SSID";
+const char* hasloWifi  = "TWOJE_HASLO_WIFI";
+const char* serwerMqtt = "IP_RASPBERRY_PI";
 
-WiFiClient   klientWifi;
-PubSubClient klientMqtt(klientWifi);
+const char* topicAlarm       = "/plytka_antywlamaniowa/zaszyfrowane";
+const char* topicOnline      = "/plytka_antywlamaniowa/online";
+const char* topicSetAlgorytm = "/plytka_antywlamaniowa/set_algorytm";
 
-// --- PINY ---
-// GPIO34 i GPIO35 to piny tylko-wejsciowe (input-only) — nie mozna ich skonfigurowac jako wyjscie
-#define PIR_PIN    34  // input-only
-#define REED_PIN   35  // input-only; brak wewnetrznego pullupa — zewnetrzny 10kΩ do 3.3V; uzyj INPUT
-#define BUZZER_PIN 15
-
-// MFRC522 (SPI): SS=GPIO5, SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19 (domyslne SPI ESP32), RST=GPIO4; IRQ niepodlaczony
-#define RFID_SS   5
-#define RFID_RST  4
-
-// --- KLAWIATURA 4x4 ---
-const byte WIERSZE = 4;
-const byte KOLUMNY = 4;
-char klawisze[WIERSZE][KOLUMNY] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
-};
-byte pinyWierszy[WIERSZE] = {32, 33, 25, 26};  // R1=32, R2=33, R3=25, R4=26
-byte pinyKolumn[KOLUMNY]  = {27, 14, 13, 12};  // C1=27, C2=14, C3=13, C4=12
-Keypad klawiatura = Keypad(makeKeymap(klawisze), pinyWierszy, pinyKolumn, WIERSZE, KOLUMNY);
-
-// ADXL345 (I2C): SDA=GPIO21, SCL=GPIO22; CS->3.3V (wymusza tryb I2C), SDO->GND (adres 0x53)
-MFRC522 rfid(RFID_SS, RFID_RST);
-byte masterUID[] = {0x4A, 0x81, 0x4D, 0x06};
-Adafruit_ADXL345_Unified akcelerometr = Adafruit_ADXL345_Unified(12345);
-
-// --- STANY SYSTEMU ALARMOWEGO ---
-enum StanAlarmu { ROZBROJONY, UZBRAJANIE, CZUWA, OCZEKUJE, ALARM };
-StanAlarmu aktualnyStanAlarmu = ROZBROJONY;
-String kodWejsciowy = "";
-
-// --- PARAMETRY CZASOWE [ms] ---
-unsigned long timerStanu = 0;
-const unsigned long CZAS_WYJSCIA             = 3000;
-const unsigned long CZAS_WEJSCIA             = 5000;
-const unsigned long INTERWAL_RAPORTU         = 15000;  // 15s — balans: dashboard zywy, RPi nie przeciazony
-const unsigned long INTERWAL_HEARTBEAT       = 10000;
-const unsigned long CZAS_POTWIERDZENIA_RUCHU = 1000;  // debounce PIR
-
-// --- PROG CZULOCI AKCELEROMETRU ---
-const float PROG_WSTRZASU = 3.0;  // [m/s²] na osi X; wyreguluj pod instalacje
-
-// --- OCHRONA PRZED BRUTE-FORCE PIN ---
-const byte          MAKS_BLEDNYCH_PROB = 3;
-const unsigned long CZAS_BLOKADY      = 30000;  // 30s blokady klawiatury po N bledach
-byte          licznikBledow = 0;
-unsigned long czasBlokady   = 0;  // 0 = brak aktywnej blokady
-
-// --- PARAMETRY POLACZEN ---
-unsigned long ostatniRaport    = 0;
-unsigned long ostatniHeartbeat = 0;
-unsigned long czasRuchuPir     = 0;
-unsigned long ostatniProbaWifi = 0;
-
-// --- CACHE OSTATNIO WYSLANYCH WARTOSCI (wykrywanie zmian/zdarzen) ---
-StanAlarmu ostatniWyslanyStan = ROZBROJONY;
-int   ostatniStanPir  = -1;
-int   ostatniStanReed = -1;
-float ostatniAccX = 0.0, ostatniAccY = 0.0, ostatniAccZ = 0.0;
-
-// Klucz AES-128 — musi byc identyczny z KLUCZ_AES w mqtt_to_influx.py
-const unsigned char KLUCZ_AES[16] = {
-  '1','2','3','4','5','6','7','8','9','0','1','2','3','4','5','6'
+const unsigned char kluczAes[16] = {
+    '1','2','3','4','5','6','7','8','9','0','1','2','3','4','5','6'
 };
 
-// --- DEKLARACJE ---
-void konfigurujWifi();
-void polaczMqtt();
-String pobierzNazwStanu(StanAlarmu stan);
-inline void dodajHex(String &s, unsigned char bajt);
-void zaszyfruj(const char* dane, int dlugosc, int algorytm, String &wynik);
-void wyslijMqtt(int pir, int reed, float ax, float ay, float az);
-void obsluzKlawiature();
-void obsluzRfid();
+#define PIN_PIR      34
+#define PIN_REED     35
+#define PIN_BUZZER   15
+#define PIN_RFID_SS   5
+#define PIN_RFID_RST  4
 
-// Odbiera numer algorytmu przez MQTT — zmiana bez reflashowania urzadzenia
-void wywolanieMqtt(char* topic, byte* payload, unsigned int dlugosc) {
-  String wiadomosc = "";
-  for (unsigned int i = 0; i < dlugosc; i++) wiadomosc += (char)payload[i];
-  int nowyAlgorytm = wiadomosc.toInt();
-  if (nowyAlgorytm >= 0 && nowyAlgorytm <= 8) {
-    WYBRANY_ALGORYTM = nowyAlgorytm;
-    Serial.print("[MQTT] Zmieniono algorytm na: "); Serial.println(WYBRANY_ALGORYTM);
-  }
+static const byte LICZBA_WIERSZY = 4;
+static const byte LICZBA_KOLUMN  = 4;
+static char mapaKlawiszy[LICZBA_WIERSZY][LICZBA_KOLUMN] = {
+    {'1','2','3','A'},
+    {'4','5','6','B'},
+    {'7','8','9','C'},
+    {'*','0','#','D'}
+};
+static byte pinyWierszy[LICZBA_WIERSZY] = {32, 33, 25, 26};
+static byte pinyKolumn[LICZBA_KOLUMN]   = {27, 14, 13, 12};
+
+enum StanAlarmu : uint8_t { ROZBROJONY, UZBRAJANIE, CZUWA, OCZEKUJE, ALARM };
+
+static const uint32_t CZAS_WYJSCIA             =  3000;
+static const uint32_t CZAS_WEJSCIA             =  5000;
+static const uint32_t INTERWAL_RAPORTU         = 60000;
+static const uint32_t INTERWAL_HEARTBEAT       = 10000;
+static const uint32_t CZAS_POTWIERDZENIA_RUCHU =   300;
+static const uint32_t INTERWAL_PETLI_MQTT      =    10;
+static const uint32_t ANTYSPAM_ANOMALII        =  5000;
+
+static const float PROG_WSTRZASU_UZBROJONY = 2.0f;
+static const float PROG_WSTRZASU_SABOTAZ   = 3.5f;
+static const byte  MAKSYMALNA_LICZBA_PROB  = 3;
+static const uint32_t CZAS_BLOKADY         = 30000;
+
+static byte kartaWzorcowa[] = {0x4A, 0x81, 0x4D, 0x06};
+static const char kodPin[] = "1234";
+
+enum RodzajZdarzenia : uint8_t {
+    ZD_KLAWISZ,
+    ZD_RFID_OK,
+    ZD_RFID_BLAD,
+    ZD_WYZWALACZ,
+};
+
+struct Zdarzenie {
+    RodzajZdarzenia rodzaj;
+    char dane[8];
+};
+
+struct WiadomoscMqtt {
+    char temat[64];
+    char payload[1200];
+    bool zachowaj;
+};
+
+struct StanSystemu {
+    StanAlarmu stan;
+    int   pir;
+    int   reed;
+    float przyspX, przyspY, przyspZ;
+};
+
+Keypad                   klawiatura = Keypad(makeKeymap(mapaKlawiszy),
+                                             pinyWierszy, pinyKolumn,
+                                             LICZBA_WIERSZY, LICZBA_KOLUMN);
+MFRC522                  czytnikRfid(PIN_RFID_SS, PIN_RFID_RST);
+Adafruit_ADXL345_Unified akcelerometr(12345);
+WiFiClient                klientWifi;
+PubSubClient              klientMqtt(klientWifi);
+
+static SemaphoreHandle_t mutexStanu;
+static QueueHandle_t     kolejkaZdarzen;
+static QueueHandle_t     kolejkaMqtt;
+static StanSystemu       stanSystemu;
+
+inline void dodajHex(String& s, unsigned char bajt) {
+    static const char znakiHex[] = "0123456789abcdef";
+    s += znakiHex[bajt >> 4];
+    s += znakiHex[bajt & 0x0F];
+}
+
+void zaszyfruj(const char* dane, int dlugosc, int algorytm, String& wynik) {
+    wynik = "";
+    wynik.reserve(dlugosc * 2 + 32);
+
+    int dlugoscZPaddingiem = dlugosc + (16 - (dlugosc % 16));
+    unsigned char buforDanych[256]      = {0};
+    unsigned char buforSzyfrogramu[256] = {0};
+
+    switch (algorytm) {
+
+        case 0:
+            wynik = dane;
+            return;
+
+        case 1:
+            wynik = base64::encode((const uint8_t*)dane, dlugosc);
+            return;
+
+        case 2:
+            for (int i = 0; i < dlugosc; ++i) {
+                char znak = dane[i];
+                wynik += (znak >= 32 && znak <= 126) ? (char)((znak - 32 + 3) % 95 + 32) : znak;
+            }
+            return;
+
+        case 3: {
+            const char kluczXor[] = "1234";
+            for (int i = 0; i < dlugosc; ++i)
+                dodajHex(wynik, (unsigned char)(dane[i] ^ kluczXor[i & 3]));
+            return;
+        }
+
+        case 4: {
+            const char kluczVigenere[] = "TAJNE";
+            for (int i = 0; i < dlugosc; ++i) {
+                char znak = dane[i];
+                int przesuniecie = kluczVigenere[i % 5] - 32;
+                wynik += (znak >= 32 && znak <= 126) ? (char)((znak - 32 + przesuniecie) % 95 + 32) : znak;
+            }
+            return;
+        }
+
+        case 5: {
+            const char kluczRc4[] = "1234567890123456";
+            unsigned char tablicaS[256];
+            for (int i = 0; i < 256; ++i) tablicaS[i] = i;
+            int j = 0;
+            for (int i = 0; i < 256; ++i) {
+                j = (j + tablicaS[i] + kluczRc4[i & 15]) % 256;
+                std::swap(tablicaS[i], tablicaS[j]);
+            }
+            int iR = 0, jR = 0;
+            for (int n = 0; n < dlugosc; ++n) {
+                iR = (iR + 1) % 256;
+                jR = (jR + tablicaS[iR]) % 256;
+                std::swap(tablicaS[iR], tablicaS[jR]);
+                dodajHex(wynik, (unsigned char)(dane[n] ^ tablicaS[(tablicaS[iR] + tablicaS[jR]) % 256]));
+            }
+            return;
+        }
+
+        case 6: {
+            mbedtls_aes_context kontekst;
+            mbedtls_aes_init(&kontekst);
+            mbedtls_aes_setkey_enc(&kontekst, kluczAes, 128);
+            memcpy(buforDanych, dane, dlugosc);
+            unsigned char dopelnienie = dlugoscZPaddingiem - dlugosc;
+            memset(buforDanych + dlugosc, dopelnienie, dopelnienie);
+            for (int i = 0; i < dlugoscZPaddingiem; i += 16)
+                mbedtls_aes_crypt_ecb(&kontekst, MBEDTLS_AES_ENCRYPT,
+                                      buforDanych + i, buforSzyfrogramu + i);
+            for (int i = 0; i < dlugoscZPaddingiem; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
+            mbedtls_aes_free(&kontekst);
+            return;
+        }
+
+        case 7: {
+            mbedtls_aes_context kontekst;
+            mbedtls_aes_init(&kontekst);
+            mbedtls_aes_setkey_enc(&kontekst, kluczAes, 128);
+            unsigned char wektorIv[16] = {0};
+            memcpy(buforDanych, dane, dlugosc);
+            unsigned char dopelnienie = dlugoscZPaddingiem - dlugosc;
+            memset(buforDanych + dlugosc, dopelnienie, dopelnienie);
+            mbedtls_aes_crypt_cbc(&kontekst, MBEDTLS_AES_ENCRYPT,
+                                  dlugoscZPaddingiem, wektorIv, buforDanych, buforSzyfrogramu);
+            for (int i = 0; i < dlugoscZPaddingiem; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
+            mbedtls_aes_free(&kontekst);
+            return;
+        }
+
+        case 8: {
+            mbedtls_gcm_context kontekst;
+            mbedtls_gcm_init(&kontekst);
+            mbedtls_gcm_setkey(&kontekst, MBEDTLS_CIPHER_ID_AES, kluczAes, 128);
+            unsigned char nonce[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+            unsigned char tag[16];
+            mbedtls_gcm_crypt_and_tag(&kontekst, MBEDTLS_GCM_ENCRYPT, dlugosc,
+                                      nonce, 12, nullptr, 0,
+                                      (const unsigned char*)dane, buforSzyfrogramu, 16, tag);
+            for (int i = 0; i < dlugosc; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
+            for (int i = 0; i < 16; ++i)      dodajHex(wynik, tag[i]);
+            mbedtls_gcm_free(&kontekst);
+            return;
+        }
+
+        default:
+            wynik = dane;
+    }
+}
+
+static void sygnalBuzzer(uint32_t czasMs) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(czasMs));
+    digitalWrite(PIN_BUZZER, LOW);
+}
+
+static String nazwaStanu(StanAlarmu stan) {
+    switch (stan) {
+        case ROZBROJONY: return "rozbrojony";
+        case UZBRAJANIE: return "uzbrajanie";
+        case CZUWA:      return "czuwa";
+        case OCZEKUJE:   return "oczekuje_na_rfid";
+        case ALARM:      return "ALARM";
+        default:         return "nieznany";
+    }
+}
+
+static void wyslijDoKolejkiMqtt(StanAlarmu stan, int pir, int reed,
+                                 float przyspX, float przyspY, float przyspZ,
+                                 const String& zrodloRaportu) {
+    JsonDocument dokument;
+    dokument["status"]    = nazwaStanu(stan);
+    dokument["pir"]       = pir;
+    dokument["drzwi"]     = reed;
+    dokument["zdarzenie"] = zrodloRaportu;
+    JsonObject przyspieszenie = dokument["akcelerometr"].to<JsonObject>();
+    przyspieszenie["x"] = round(przyspX * 100.0f) / 100.0f;
+    przyspieszenie["y"] = round(przyspY * 100.0f) / 100.0f;
+    przyspieszenie["z"] = round(przyspZ * 100.0f) / 100.0f;
+
+    char buforJson[256];
+    int dlugoscJson = serializeJson(dokument, buforJson, sizeof(buforJson));
+
+    int algorytm = wybranyAlgorytm;
+
+    Serial.println("\n==================================================");
+    Serial.printf("[PROFILOWANIE - ALGORYTM %d]\n", algorytm);
+    Serial.printf("-> Dane surowe JSON: %s\n", buforJson);
+    Serial.printf("-> Rozmiar surowy: %d B\n", dlugoscJson);
+
+    String zaszyfrowane = "";
+    unsigned long poczatek = micros();
+    zaszyfruj(buforJson, dlugoscJson, algorytm, zaszyfrowane);
+    unsigned long czasSzyfrowania = micros() - poczatek;
+
+    String finalnaWiadomosc = String(algorytm) + ":" + zaszyfrowane;
+    float narzut = ((float)((int)finalnaWiadomosc.length() - dlugoscJson) / dlugoscJson) * 100.0f;
+
+    Serial.printf("-> Szyfrogram: %s\n",              finalnaWiadomosc.c_str());
+    Serial.printf("-> Rozmiar po szyfrowaniu: %d B\n", finalnaWiadomosc.length());
+    Serial.printf("-> 1. CZAS SZYFROWANIA: %lu us\n",  czasSzyfrowania);
+    Serial.printf("-> 2. NARZUT PRZESYLU: +%.2f%%\n",  narzut);
+    Serial.printf("-> 3. WOLNY RAM (heap): %u B\n",    ESP.getFreeHeap());
+    Serial.println("==================================================");
+
+    WiadomoscMqtt wiadomosc;
+    strncpy(wiadomosc.temat,   topicAlarm,               sizeof(wiadomosc.temat)   - 1);
+    strncpy(wiadomosc.payload, finalnaWiadomosc.c_str(), sizeof(wiadomosc.payload) - 1);
+    wiadomosc.zachowaj = false;
+
+    if (xQueueSend(kolejkaMqtt, &wiadomosc, pdMS_TO_TICKS(50)) != pdTRUE) {
+        Serial.println("[WARN] kolejkaMqtt pelna");
+    }
+}
+
+void wywolanieMqtt(char* temat, byte* payload, unsigned int dlugosc) {
+    if (strcmp(temat, topicSetAlgorytm) != 0 || dlugosc < 1) return;
+    int nowyAlgorytm = payload[0] - '0';
+    if (nowyAlgorytm >= 0 && nowyAlgorytm <= 8) {
+        wybranyAlgorytm = nowyAlgorytm;
+        Serial.printf("[MQTT] Algorytm -> %d\n", nowyAlgorytm);
+    }
+}
+
+void polaczZBrokeremMqtt() {
+    char identyfikator[32];
+    snprintf(identyfikator, sizeof(identyfikator), "esp32-alarm-%lu", millis());
+    if (klientMqtt.connect(identyfikator, nullptr, nullptr, topicOnline, 0, true, "offline")) {
+        klientMqtt.publish(topicOnline, "online", true);
+        klientMqtt.subscribe(topicSetAlgorytm);
+        Serial.println("[MQTT] Polaczono");
+    } else {
+        Serial.printf("[MQTT] Blad: %d\n", klientMqtt.state());
+    }
+}
+
+static void taskKomunikacja(void* parametry) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, hasloWifi);
+    Serial.print("[WiFi] Lacze");
+    while (WiFi.status() != WL_CONNECTED) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Serial.print(".");
+    }
+    Serial.printf("\n[WiFi] OK  IP: %s\n", WiFi.localIP().toString().c_str());
+
+    klientMqtt.setServer(serwerMqtt, 1883);
+    klientMqtt.setBufferSize(2048);
+    klientMqtt.setCallback(wywolanieMqtt);
+    polaczZBrokeremMqtt();
+
+    TickType_t ostatniHeartbeat  = xTaskGetTickCount();
+    TickType_t ostatniaProbaWifi = 0;
+
+    while (true) {
+        if (WiFi.status() != WL_CONNECTED) {
+            TickType_t teraz = xTaskGetTickCount();
+            if (teraz - ostatniaProbaWifi >= pdMS_TO_TICKS(5000)) {
+                WiFi.reconnect();
+                ostatniaProbaWifi = teraz;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (!klientMqtt.connected()) {
+            polaczZBrokeremMqtt();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        klientMqtt.loop();
+
+        TickType_t teraz = xTaskGetTickCount();
+        if (teraz - ostatniHeartbeat >= pdMS_TO_TICKS(INTERWAL_HEARTBEAT)) {
+            klientMqtt.publish(topicOnline, "online", true);
+            ostatniHeartbeat = teraz;
+        }
+
+        WiadomoscMqtt wiadomosc;
+        if (xQueueReceive(kolejkaMqtt, &wiadomosc, 0) == pdTRUE) {
+            klientMqtt.publish(wiadomosc.temat,
+                               (const uint8_t*)wiadomosc.payload,
+                               strlen(wiadomosc.payload),
+                               wiadomosc.zachowaj);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(INTERWAL_PETLI_MQTT));
+    }
+}
+
+static void taskKlawiatura(void* parametry) {
+    while (true) {
+        char klawisz = klawiatura.getKey();
+        if (klawisz) {
+            Zdarzenie zdarzenie;
+            zdarzenie.rodzaj  = ZD_KLAWISZ;
+            zdarzenie.dane[0] = klawisz;
+            zdarzenie.dane[1] = 0;
+            xQueueSend(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(20));
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void taskSensory(void* parametry) {
+    TickType_t czasPotwierdzeniaPir   = 0;
+    TickType_t czasOstatniejAnomalii  = 0;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        int pir  = digitalRead(PIN_PIR);
+        int reed = digitalRead(PIN_REED);
+        sensors_event_t zdarzenieCzujnika;
+        akcelerometr.getEvent(&zdarzenieCzujnika);
+        float przyspX = zdarzenieCzujnika.acceleration.x;
+        float przyspY = zdarzenieCzujnika.acceleration.y;
+        float przyspZ = zdarzenieCzujnika.acceleration.z;
+        float modulPrzyspieszenia = sqrtf(przyspX * przyspX + przyspY * przyspY + przyspZ * przyspZ);
+
+        if (xSemaphoreTake(mutexStanu, pdMS_TO_TICKS(10)) == pdTRUE) {
+            stanSystemu.pir     = pir;
+            stanSystemu.reed    = reed;
+            stanSystemu.przyspX = przyspX;
+            stanSystemu.przyspY = przyspY;
+            stanSystemu.przyspZ = przyspZ;
+            xSemaphoreGive(mutexStanu);
+        }
+
+        if (czytnikRfid.PICC_IsNewCardPresent() && czytnikRfid.PICC_ReadCardSerial()) {
+            bool zgodnaKarta = true;
+            for (byte i = 0; i < 4; i++) {
+                if (czytnikRfid.uid.uidByte[i] != kartaWzorcowa[i]) { zgodnaKarta = false; break; }
+            }
+            czytnikRfid.PICC_HaltA();
+
+            Zdarzenie zdarzenie;
+            zdarzenie.rodzaj  = zgodnaKarta ? ZD_RFID_OK : ZD_RFID_BLAD;
+            zdarzenie.dane[0] = 0;
+            xQueueSend(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(20));
+
+            Serial.printf("[RFID] %s\n", zgodnaKarta ? "Autoryzacja OK" : "Odmowa dostepu");
+        }
+
+        if (xSemaphoreTake(mutexStanu, pdMS_TO_TICKS(5)) == pdTRUE) {
+            StanAlarmu stanAktualny = stanSystemu.stan;
+            xSemaphoreGive(mutexStanu);
+
+            if (stanAktualny == CZUWA) {
+                if (pir == HIGH) {
+                    if (czasPotwierdzeniaPir == 0) czasPotwierdzeniaPir = xTaskGetTickCount();
+                    bool ruchPotwierdzony = (xTaskGetTickCount() - czasPotwierdzeniaPir >=
+                                             pdMS_TO_TICKS(CZAS_POTWIERDZENIA_RUCHU));
+                    if (ruchPotwierdzony) {
+                        Zdarzenie zdarzenie = {ZD_WYZWALACZ, {'P', 0}};
+                        xQueueSend(kolejkaZdarzen, &zdarzenie, 0);
+                    }
+                } else {
+                    czasPotwierdzeniaPir = 0;
+                }
+
+                if (reed == HIGH) {
+                    Zdarzenie zdarzenie = {ZD_WYZWALACZ, {'R', 0}};
+                    xQueueSend(kolejkaZdarzen, &zdarzenie, 0);
+                }
+
+                if (fabsf(modulPrzyspieszenia - 9.8f) > PROG_WSTRZASU_UZBROJONY) {
+                    Zdarzenie zdarzenie = {ZD_WYZWALACZ, {'W', 0}};
+                    xQueueSend(kolejkaZdarzen, &zdarzenie, 0);
+                }
+            } else {
+                bool sabotaz = fabsf(modulPrzyspieszenia - 9.8f) > PROG_WSTRZASU_SABOTAZ;
+                if (sabotaz && (xTaskGetTickCount() - czasOstatniejAnomalii >=
+                                pdMS_TO_TICKS(ANTYSPAM_ANOMALII))) {
+                    czasOstatniejAnomalii = xTaskGetTickCount();
+                    Serial.println("[SABOTAZ] Wykryto ingerencje fizyczna");
+                    wyslijDoKolejkiMqtt(stanAktualny, pir, reed, przyspX, przyspY, przyspZ, "sabotaz");
+                }
+            }
+        }
+    }
+}
+
+static void ustawStan(StanAlarmu nowyStan) {
+    if (xSemaphoreTake(mutexStanu, pdMS_TO_TICKS(20)) == pdTRUE) {
+        stanSystemu.stan = nowyStan;
+        xSemaphoreGive(mutexStanu);
+    }
+    Serial.printf("[STAN] -> %s\n", nazwaStanu(nowyStan).c_str());
+}
+
+static StanAlarmu pobierzStan() {
+    StanAlarmu stan = ROZBROJONY;
+    if (xSemaphoreTake(mutexStanu, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stan = stanSystemu.stan;
+        xSemaphoreGive(mutexStanu);
+    }
+    return stan;
+}
+
+static void taskMaszynaStanow(void* parametry) {
+    char       buforKodu[5]          = {0};
+    int        indeksKodu            = 0;
+    int        liczbaBlednychProb    = 0;
+    TickType_t czasBlokady           = 0;
+
+    TickType_t ostatniRaport       = xTaskGetTickCount();
+    StanAlarmu ostatnioWyslanyStan = ROZBROJONY;
+
+    while (true) {
+        StanAlarmu stan = pobierzStan();
+
+        TickType_t teraz   = xTaskGetTickCount();
+        bool zmianaStanu   = (stan != ostatnioWyslanyStan);
+        bool minalInterwal = (teraz - ostatniRaport >= pdMS_TO_TICKS(INTERWAL_RAPORTU));
+
+        if (zmianaStanu || minalInterwal) {
+            int pir = 0, reed = 0; float przyspX = 0, przyspY = 0, przyspZ = 0;
+            if (xSemaphoreTake(mutexStanu, pdMS_TO_TICKS(20)) == pdTRUE) {
+                pir     = stanSystemu.pir;
+                reed    = stanSystemu.reed;
+                przyspX = stanSystemu.przyspX;
+                przyspY = stanSystemu.przyspY;
+                przyspZ = stanSystemu.przyspZ;
+                xSemaphoreGive(mutexStanu);
+            }
+            wyslijDoKolejkiMqtt(stan, pir, reed, przyspX, przyspY, przyspZ,
+                                zmianaStanu ? "zmiana_stanu" : "okresowy");
+            ostatniRaport       = teraz;
+            ostatnioWyslanyStan = stan;
+        }
+
+        Zdarzenie zdarzenie;
+
+        switch (stan) {
+
+            case ROZBROJONY: {
+                if (xQueueReceive(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(200)) != pdTRUE) break;
+
+                if (zdarzenie.rodzaj == ZD_RFID_OK) {
+                    sygnalBuzzer(50);
+                    break;
+                }
+
+                if (zdarzenie.rodzaj != ZD_KLAWISZ) break;
+
+                if (czasBlokady) {
+                    if (xTaskGetTickCount() - czasBlokady < pdMS_TO_TICKS(CZAS_BLOKADY)) {
+                        Serial.println("[PIN] ZABLOKOWANE - poczekaj 30s.");
+                        break;
+                    }
+                    czasBlokady = 0; liczbaBlednychProb = 0;
+                    Serial.println("[PIN] Odblokowano.");
+                }
+
+                char klawisz = zdarzenie.dane[0];
+                if (klawisz == '*') {
+                    memset(buforKodu, 0, 5); indeksKodu = 0;
+                    sygnalBuzzer(50);
+                    Serial.println("[PIN] Wyczyszczono.");
+                    break;
+                }
+
+                sygnalBuzzer(20);
+                buforKodu[indeksKodu++] = klawisz;
+                Serial.print("*");
+
+                if (indeksKodu >= 4) {
+                    if (strcmp(buforKodu, kodPin) == 0) {
+                        liczbaBlednychProb = 0; czasBlokady = 0;
+                        Serial.println("\n[PIN] Poprawny! Masz 3s na wyjscie.");
+                        sygnalBuzzer(500);
+                        ustawStan(UZBRAJANIE);
+                    } else {
+                        liczbaBlednychProb++;
+                        Serial.printf("\n[PIN] Bledny! Proba %d/%d\n",
+                                      liczbaBlednychProb, MAKSYMALNA_LICZBA_PROB);
+                        sygnalBuzzer(100); vTaskDelay(pdMS_TO_TICKS(50)); sygnalBuzzer(100);
+                        if (liczbaBlednychProb >= MAKSYMALNA_LICZBA_PROB) {
+                            czasBlokady = xTaskGetTickCount();
+                            Serial.println("[PIN] KLAWIATURA ZABLOKOWANA na 30s!");
+                            vTaskDelay(pdMS_TO_TICKS(50)); sygnalBuzzer(100);
+                        }
+                    }
+                    memset(buforKodu, 0, 5); indeksKodu = 0;
+                }
+                break;
+            }
+
+            case UZBRAJANIE: {
+                for (uint32_t ms = 0; ms < CZAS_WYJSCIA; ms += 1000) {
+                    sygnalBuzzer(200);
+                    if (xQueueReceive(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(800)) == pdTRUE) {
+                        if ((zdarzenie.rodzaj == ZD_KLAWISZ && zdarzenie.dane[0] == '#') ||
+                             zdarzenie.rodzaj == ZD_RFID_OK) {
+                            ustawStan(ROZBROJONY);
+                            goto koniecUzbrajania;
+                        }
+                    }
+                }
+                ustawStan(CZUWA);
+                Serial.println("[STAN] System uzbrojony - czuwa.");
+                sygnalBuzzer(200);
+                koniecUzbrajania:;
+                break;
+            }
+
+            case CZUWA: {
+                if (xQueueReceive(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(100)) != pdTRUE) break;
+
+                if (zdarzenie.rodzaj == ZD_RFID_OK) {
+                    ustawStan(ROZBROJONY);
+                    sygnalBuzzer(500);
+                    break;
+                }
+
+                if (zdarzenie.rodzaj == ZD_WYZWALACZ) {
+                    Serial.printf("[CZUWA] Wyzwalacz: %c - 5s na autoryzacje!\n",
+                                  zdarzenie.dane[0]);
+                    sygnalBuzzer(50);
+                    ustawStan(OCZEKUJE);
+                }
+                break;
+            }
+
+            case OCZEKUJE: {
+                TickType_t koniecOkna = xTaskGetTickCount() + pdMS_TO_TICKS(CZAS_WEJSCIA);
+
+                while (xTaskGetTickCount() < koniecOkna) {
+                    TickType_t pozostaloCzasu = koniecOkna - xTaskGetTickCount();
+                    if (xQueueReceive(kolejkaZdarzen, &zdarzenie, pozostaloCzasu) == pdTRUE) {
+                        if (zdarzenie.rodzaj == ZD_RFID_OK) {
+                            ustawStan(ROZBROJONY);
+                            digitalWrite(PIN_BUZZER, LOW);
+                            sygnalBuzzer(500);
+                            goto koniecOczekiwania;
+                        }
+                    }
+                }
+                ustawStan(ALARM);
+                Serial.println("[STAN] ALARM WYZWOLONY!");
+                koniecOczekiwania:;
+                break;
+            }
+
+            case ALARM: {
+                if (xQueueReceive(kolejkaZdarzen, &zdarzenie, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    if (zdarzenie.rodzaj == ZD_RFID_OK) {
+                        digitalWrite(PIN_BUZZER, LOW);
+                        liczbaBlednychProb = 0; czasBlokady = 0;
+                        ustawStan(ROZBROJONY);
+                        Serial.println("[RFID] Autoryzacja - system rozbrojony.");
+                    }
+                } else {
+                    digitalWrite(PIN_BUZZER, !digitalRead(PIN_BUZZER));
+                }
+                break;
+            }
+        }
+    }
 }
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("\n[BOOT] Plytka antywlamaniowa");
 
-  pinMode(PIR_PIN,    INPUT);
-  pinMode(REED_PIN,   INPUT);   // INPUT — GPIO35 nie ma wewnetrznego pullupa
-  pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(PIN_PIR,    INPUT);
+    pinMode(PIN_REED,   INPUT);
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
 
-  SPI.begin();
-  rfid.PCD_Init();
-  Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22 dla ADXL345
+    SPI.begin();
+    czytnikRfid.PCD_Init();
 
-  if (!akcelerometr.begin()) Serial.println("Blad: Nie znaleziono ADXL345!");
+    Wire.begin(21, 22);
+    if (!akcelerometr.begin()) Serial.println("[WARN] ADXL345 nie odpowiada!");
 
-  kodWejsciowy.reserve(5);
+    stanSystemu.stan = ROZBROJONY;
 
-  konfigurujWifi();
-  klientMqtt.setServer(serwerMqtt, 1883);
-  klientMqtt.setBufferSize(1024);
-  klientMqtt.setCallback(wywolanieMqtt);
+    mutexStanu     = xSemaphoreCreateMutex();
+    kolejkaZdarzen = xQueueCreate(10, sizeof(Zdarzenie));
+    kolejkaMqtt    = xQueueCreate(5,  sizeof(WiadomoscMqtt));
+    configASSERT(mutexStanu);
+    configASSERT(kolejkaZdarzen);
+    configASSERT(kolejkaMqtt);
 
-  Serial.println("System uruchomiony.");
-}
+    xTaskCreatePinnedToCore(taskKomunikacja,   "Komunikacja",   6144,  nullptr, 5, nullptr, 0);
+    xTaskCreatePinnedToCore(taskKlawiatura,    "Klawiatura",    3072,  nullptr, 6, nullptr, 1);
+    xTaskCreatePinnedToCore(taskSensory,       "Sensory",       4096,  nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(taskMaszynaStanow, "MaszynaStanow", 10240, nullptr, 4, nullptr, 1);
 
-void konfigurujWifi() {
-  delay(10);
-  Serial.print("Lacze z WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, hasloWifi);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println(" OK");
-  Serial.println(WiFi.localIP());
-}
-
-void polaczMqtt() {
-  if (!klientMqtt.connected()) {
-    String idKlienta = "ESP32-Alarm-" + String(random(0xffff), HEX);
-    // LWT: broker sam opublikuje "offline" gdy urzadzenie zniknie bez rozlaczenia (reset, zanik zasil.)
-    if (klientMqtt.connect(idKlienta.c_str(), NULL, NULL, topicOnline, 0, true, "offline")) {
-      klientMqtt.publish(topicOnline, "online", true);  // retained — widoczne dla nowych subskrybentow
-      klientMqtt.subscribe(topicSetAlgorytm);
-      Serial.println("Polaczono z MQTT.");
-    }
-  }
-}
-
-String pobierzNazwStanu(StanAlarmu stan) {
-  switch (stan) {
-    case ROZBROJONY: return "rozbrojony";
-    case UZBRAJANIE: return "uzbrajanie";
-    case CZUWA:      return "czuwa";
-    case OCZEKUJE:   return "oczekuje_na_rfid";
-    case ALARM:      return "ALARM";
-    default:         return "nieznany";
-  }
-}
-
-// Szybszy od sprintf("%02x") — unika parsowania stringa formatu przy kazdym bajcie
-inline void dodajHex(String &s, unsigned char bajt) {
-  static const char ZNAKI_HEX[] = "0123456789abcdef";
-  s += ZNAKI_HEX[(bajt >> 4) & 0x0F];
-  s += ZNAKI_HEX[bajt & 0x0F];
-}
-
-// =================================================================
-// SILNIK KRYPTOGRAFICZNY
-// Szyfruje dane wybranym algorytmem, wynik zapisuje do `wynik`
-// przez referencje (unika kopiowania Stringa)
-// =================================================================
-void zaszyfruj(const char* dane, int dlugosc, int algorytm, String &wynik) {
-  wynik = "";
-  wynik.reserve(dlugosc * 2 + 32);
-
-  int dlugoscZPaddingiem = dlugosc + (16 - (dlugosc % 16));
-  unsigned char buforDanych[256]      = {0};
-  unsigned char buforSzyfrogramu[256] = {0};
-
-  switch (algorytm) {
-
-    case 0:
-      wynik = dane;
-      return;
-
-    case 1:
-      wynik = base64::encode((const uint8_t*)dane, dlugosc);
-      return;
-
-    case 2:  // rotacja w przestrzeni drukowalnych ASCII (32–126)
-      for (int i = 0; i < dlugosc; ++i) {
-        char c = dane[i];
-        wynik += (c >= 32 && c <= 126) ? (char)((c - 32 + 3) % 95 + 32) : c;
-      }
-      return;
-
-    case 3:
-      {
-        const char kluczXor[] = "1234";
-        for (int i = 0; i < dlugosc; ++i)
-          dodajHex(wynik, (unsigned char)(dane[i] ^ kluczXor[i & 3]));
-      }
-      return;
-
-    case 4:
-      {
-        const char kluczVig[] = "TAJNE";
-        for (int i = 0; i < dlugosc; ++i) {
-          char c = dane[i];
-          int przesuniecie = kluczVig[i % 5] - 32;
-          wynik += (c >= 32 && c <= 126) ? (char)((c - 32 + przesuniecie) % 95 + 32) : c;
-        }
-      }
-      return;
-
-    case 5:
-      {
-        const char kluczRc4[] = "1234567890123456";
-        unsigned char S[256];
-        for (int i = 0; i < 256; ++i) S[i] = i;
-
-        // KSA (Key Scheduling Algorithm)
-        int j = 0;
-        for (int i = 0; i < 256; ++i) {
-          j = (j + S[i] + kluczRc4[i & 15]) % 256;
-          std::swap(S[i], S[j]);
-        }
-
-        // PRGA (Pseudo-Random Generation Algorithm)
-        int iRc = 0, jRc = 0;
-        for (int n = 0; n < dlugosc; ++n) {
-          iRc = (iRc + 1) % 256;
-          jRc = (jRc + S[iRc]) % 256;
-          std::swap(S[iRc], S[jRc]);
-          unsigned char K = S[(S[iRc] + S[jRc]) % 256];
-          dodajHex(wynik, (unsigned char)(dane[n] ^ K));
-        }
-      }
-      return;
-
-    case 6:  // ECB: identyczne bloki plaintext → identyczne bloki szyfrogramu — slaba dyfuzja
-      {
-        mbedtls_aes_context kontekstAes;
-        mbedtls_aes_init(&kontekstAes);
-        mbedtls_aes_setkey_enc(&kontekstAes, KLUCZ_AES, 128);
-        memcpy(buforDanych, dane, dlugosc);
-        unsigned char wartoscPaddingu = dlugoscZPaddingiem - dlugosc;
-        memset(buforDanych + dlugosc, wartoscPaddingu, wartoscPaddingu);
-        for (int i = 0; i < dlugoscZPaddingiem; i += 16)
-          mbedtls_aes_crypt_ecb(&kontekstAes, MBEDTLS_AES_ENCRYPT,
-                                buforDanych + i, buforSzyfrogramu + i);
-        for (int i = 0; i < dlugoscZPaddingiem; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
-        mbedtls_aes_free(&kontekstAes);
-      }
-      return;
-
-    case 7:  // CBC: zerowy IV — uproszczenie badawcze; w produkcji IV musi byc losowy
-      {
-        mbedtls_aes_context kontekstAesCbc;
-        mbedtls_aes_init(&kontekstAesCbc);
-        mbedtls_aes_setkey_enc(&kontekstAesCbc, KLUCZ_AES, 128);
-        unsigned char wektorIV[16] = {0};
-        memcpy(buforDanych, dane, dlugosc);
-        unsigned char wartoscPaddingu = dlugoscZPaddingiem - dlugosc;
-        memset(buforDanych + dlugosc, wartoscPaddingu, wartoscPaddingu);
-        mbedtls_aes_crypt_cbc(&kontekstAesCbc, MBEDTLS_AES_ENCRYPT,
-                              dlugoscZPaddingiem, wektorIV, buforDanych, buforSzyfrogramu);
-        for (int i = 0; i < dlugoscZPaddingiem; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
-        mbedtls_aes_free(&kontekstAesCbc);
-      }
-      return;
-
-    case 8:  // GCM: tag 16B na koncu HEX; staly nonce — w produkcji unikalny per wiadomosc
-      {
-        mbedtls_gcm_context kontekstGcm;
-        mbedtls_gcm_init(&kontekstGcm);
-        mbedtls_gcm_setkey(&kontekstGcm, MBEDTLS_CIPHER_ID_AES, KLUCZ_AES, 128);
-        unsigned char nonce[12]          = {1,2,3,4,5,6,7,8,9,10,11,12};
-        unsigned char tagAutentykacji[16];
-        mbedtls_gcm_crypt_and_tag(&kontekstGcm, MBEDTLS_GCM_ENCRYPT, dlugosc,
-                                  nonce, sizeof(nonce), NULL, 0,
-                                  (const unsigned char*)dane, buforSzyfrogramu,
-                                  16, tagAutentykacji);
-        for (int i = 0; i < dlugosc; ++i) dodajHex(wynik, buforSzyfrogramu[i]);
-        for (int i = 0; i < 16; ++i)      dodajHex(wynik, tagAutentykacji[i]);
-        mbedtls_gcm_free(&kontekstGcm);
-      }
-      return;
-  }
-}
-
-// Mierzy czas szyfrowania [us], narzut rozmiaru [%] i wolny heap [B]
-// Dane zbierane przez Serial do tabel porowawczych w pracy magisterskiej
-void wyslijMqtt(int pir, int reed, float ax, float ay, float az) {
-  if (!klientMqtt.connected()) return;
-
-  JsonDocument doc;
-  doc["status"] = pobierzNazwStanu(aktualnyStanAlarmu);
-  doc["pir"]    = pir;
-  doc["drzwi"]  = reed;
-  JsonObject acc = doc["akcelerometr"].to<JsonObject>();
-  acc["x"] = round(ax * 100.0) / 100.0;
-  acc["y"] = round(ay * 100.0) / 100.0;
-  acc["z"] = round(az * 100.0) / 100.0;
-
-  char buforJson[256];
-  int dlugoscJson = serializeJson(doc, buforJson, sizeof(buforJson));
-
-  Serial.println("\n==================================================");
-  Serial.print("[PROFILOWANIE - ALGORYTM "); Serial.print(WYBRANY_ALGORYTM); Serial.println("]");
-  Serial.print("-> Dane surowe JSON: "); Serial.println(buforJson);
-  Serial.print("-> Rozmiar surowy: ");  Serial.print(dlugoscJson); Serial.println(" B");
-
-  String daneSzyfr = "";
-  unsigned long czasStart    = micros();
-  zaszyfruj(buforJson, dlugoscJson, WYBRANY_ALGORYTM, daneSzyfr);
-  unsigned long czasWykonania = micros() - czasStart;
-
-  size_t wolnyRam = ESP.getFreeHeap();
-
-  // Format: "<nr_algorytmu>:<szyfrogram>" — serwer parsuje prefiks i wywoluje odpowiedni deszyfrator
-  String finalnyPayload  = String(WYBRANY_ALGORYTM) + ":" + daneSzyfr;
-  size_t rozmiarFinalny  = finalnyPayload.length();
-  float procentowyNarzut = ((float)(rozmiarFinalny - dlugoscJson) / dlugoscJson) * 100.0;
-
-  Serial.print("-> Szyfrogram: ");              Serial.println(finalnyPayload);
-  Serial.print("-> Rozmiar po szyfrowaniu: ");  Serial.print(rozmiarFinalny); Serial.println(" B");
-  Serial.print("-> 1. CZAS SZYFROWANIA: ");     Serial.print(czasWykonania); Serial.println(" us");
-  Serial.print("-> 2. NARZUT PRZESYLU: +");     Serial.print(procentowyNarzut, 2); Serial.println("%");
-  Serial.print("-> 3. WOLNY RAM (heap): ");     Serial.print(wolnyRam); Serial.println(" B");
-  Serial.println("==================================================");
-
-  klientMqtt.publish(topicAlarm, finalnyPayload.c_str());
-}
-
-// '*' kasuje bufor kodu; klawiatura aktywna tylko w stanie ROZBROJONY
-void obsluzKlawiature() {
-  char klawisz = klawiatura.getKey();
-  if (!klawisz || aktualnyStanAlarmu != ROZBROJONY) return;
-
-  // Blokada po MAKS_BLEDNYCH_PROB blednych probach — obrona przed brute-force
-  if (czasBlokady) {
-    if (millis() - czasBlokady < CZAS_BLOKADY) {
-      Serial.println("[PIN] ZABLOKOWANE. Poczekaj przed kolejna proba.");
-      return;
-    }
-    czasBlokady   = 0;
-    licznikBledow = 0;
-    Serial.println("[PIN] Odblokowano.");
-  }
-
-  if (klawisz == '*') {
-    kodWejsciowy = "";
-    Serial.println("\n[PIN] Wyczyszczono.");
-    digitalWrite(BUZZER_PIN, HIGH); delay(50); digitalWrite(BUZZER_PIN, LOW);
-    return;
-  }
-
-  digitalWrite(BUZZER_PIN, HIGH); delay(20); digitalWrite(BUZZER_PIN, LOW);
-  kodWejsciowy += klawisz;
-  Serial.print("*");
-
-  if (kodWejsciowy.length() >= 4) {
-    if (kodWejsciowy == "1234") {
-      aktualnyStanAlarmu = UZBRAJANIE;
-      timerStanu         = millis();
-      licznikBledow      = 0;
-      czasBlokady        = 0;
-      digitalWrite(BUZZER_PIN, HIGH); delay(500); digitalWrite(BUZZER_PIN, LOW);
-      Serial.println("\n[PIN] Poprawny! Masz 3s na wyjscie.");
-    } else {
-      licznikBledow++;
-      Serial.print("\n[PIN] Bledny kod! Proba ");
-      Serial.print(licznikBledow); Serial.print("/"); Serial.println(MAKS_BLEDNYCH_PROB);
-      digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW);
-      delay(50);
-      digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW);
-
-      if (licznikBledow >= MAKS_BLEDNYCH_PROB) {
-        czasBlokady = millis();
-        Serial.println("[PIN] KLAWIATURA ZABLOKOWANA na 30s!");
-        delay(50);
-        digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW);
-      }
-    }
-    kodWejsciowy = "";
-  }
-}
-
-// Porownuje 4 bajty UID z masterUID; rozbrajanie dziala z kazdego stanu (takze ALARM)
-void obsluzRfid() {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
-
-  bool zgodnosc = true;
-  for (byte i = 0; i < 4; i++) {
-    if (rfid.uid.uidByte[i] != masterUID[i]) { zgodnosc = false; break; }
-  }
-
-  if (zgodnosc) {
-    aktualnyStanAlarmu = ROZBROJONY;
-    licznikBledow      = 0;
-    czasBlokady        = 0;
-    digitalWrite(BUZZER_PIN, LOW);  // wyciszenie — buzzer mógl byc aktywny w trybie ALARM
-    Serial.println("\n[RFID] Autoryzacja OK. System rozbrojony.");
-  } else {
-    Serial.println("\n[RFID] Zla karta - odmowa dostepu.");
-  }
-
-  rfid.PICC_HaltA();
+    Serial.println("[RTOS] Taski uruchomione");
+    Serial.println("[RTOS] Wpisz PIN (1234) aby uzbrojic system.");
 }
 
 void loop() {
-  // WiFi watchdog — throttlowany co 5s, zeby nie floodowac stosu TCP
-  if (WiFi.status() != WL_CONNECTED && millis() - ostatniProbaWifi >= 5000) {
-    Serial.println("[WiFi] Brak polaczenia. Ponawiam...");
-    WiFi.reconnect();
-    ostatniProbaWifi = millis();
-  }
-
-  if (!klientMqtt.connected()) polaczMqtt();
-  klientMqtt.loop();
-
-  if (millis() - ostatniHeartbeat >= INTERWAL_HEARTBEAT) {
-    if (klientMqtt.connected()) klientMqtt.publish(topicOnline, "online", true);
-    ostatniHeartbeat = millis();
-  }
-
-  obsluzKlawiature();
-  obsluzRfid();
-
-  int aktualnyPir  = digitalRead(PIR_PIN);
-  int aktualnyReed = digitalRead(REED_PIN);
-  sensors_event_t zdarzenie;
-  akcelerometr.getEvent(&zdarzenie);
-  float akX = zdarzenie.acceleration.x;
-  float akY = zdarzenie.acceleration.y;
-  float akZ = zdarzenie.acceleration.z;
-
-  bool wymusPublikacje = false;
-
-  if (aktualnyStanAlarmu != ostatniWyslanyStan) wymusPublikacje = true;
-
-  if (aktualnyStanAlarmu == CZUWA ||
-      aktualnyStanAlarmu == OCZEKUJE ||
-      aktualnyStanAlarmu == ALARM) {
-    if (aktualnyPir  != ostatniStanPir)  wymusPublikacje = true;
-    if (aktualnyReed != ostatniStanReed) wymusPublikacje = true;
-    if (abs(akX - ostatniAccX) > 1.5 ||
-        abs(akY - ostatniAccY) > 1.5 ||
-        abs(akZ - ostatniAccZ) > 1.5)   wymusPublikacje = true;
-  }
-
-  switch (aktualnyStanAlarmu) {
-
-    case ROZBROJONY:
-      break;
-
-    case UZBRAJANIE:
-      if (millis() - timerStanu >= CZAS_WYJSCIA) {
-        aktualnyStanAlarmu = CZUWA;
-        Serial.println("[STAN] System uzbrojony - czuwa.");
-        digitalWrite(BUZZER_PIN, HIGH); delay(200); digitalWrite(BUZZER_PIN, LOW);
-      }
-      break;
-
-    case CZUWA:
-      {
-        // Debounce PIR: sygnal musi byc ciagly przez CZAS_POTWIERDZENIA_RUCHU
-        // Eliminuje falszywe alarmy od krotkich zaklocen EMI na przewodzie PIR
-        bool prawdziwyRuch = false;
-        if (digitalRead(PIR_PIN) == HIGH) {
-          if (czasRuchuPir == 0) czasRuchuPir = millis();
-          if (millis() - czasRuchuPir >= CZAS_POTWIERDZENIA_RUCHU) prawdziwyRuch = true;
-        } else {
-          czasRuchuPir = 0;
-        }
-
-        if (prawdziwyRuch || digitalRead(REED_PIN) == HIGH || abs(akX) > PROG_WSTRZASU) {
-          aktualnyStanAlarmu = OCZEKUJE;
-          timerStanu         = millis();
-          Serial.println("[STAN] Intruz wykryty! 5s na autoryzacje karta RFID.");
-          digitalWrite(BUZZER_PIN, HIGH); delay(50); digitalWrite(BUZZER_PIN, LOW);
-        }
-      }
-      break;
-
-    case OCZEKUJE:
-      if (millis() - timerStanu >= CZAS_WEJSCIA) {
-        aktualnyStanAlarmu = ALARM;
-        Serial.println("[STAN] ALARM WYZWOLONY!");
-      }
-      break;
-
-    case ALARM:
-      // Oscylator na millis — nieblokujacy, nie zatrzymuje petli
-      digitalWrite(BUZZER_PIN, (millis() / 500) % 2);
-      break;
-  }
-
-  // Drugi sprawdzenie — stan mogl sie zmienic w switch powyzej
-  if (aktualnyStanAlarmu != ostatniWyslanyStan) wymusPublikacje = true;
-
-  if (wymusPublikacje || (millis() - ostatniRaport >= INTERWAL_RAPORTU)) {
-    wyslijMqtt(aktualnyPir, aktualnyReed, akX, akY, akZ);
-    ostatniRaport      = millis();
-    ostatniWyslanyStan = aktualnyStanAlarmu;
-    ostatniStanPir     = aktualnyPir;
-    ostatniStanReed    = aktualnyReed;
-    ostatniAccX        = akX;
-    ostatniAccY        = akY;
-    ostatniAccZ        = akZ;
-  }
+    vTaskDelay(portMAX_DELAY);
 }

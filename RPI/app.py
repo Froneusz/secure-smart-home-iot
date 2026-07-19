@@ -160,10 +160,14 @@ from(bucket: "{INFLUX_BUCKET}")
   |> filter(fn: (r) => r._measurement == "pomiary")
   |> filter(fn: (r) => r._field != "heartbeat")
   |> pivot(rowKey: ["_time", "urzadzenie"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"], desc: true)
-  |> limit(n: {limit})
 '''
-    return [_przetworz_rekord(r) for r in _flux(q)]
+    # Sortowanie i limit robimy w Pythonie, bo pivot() grupuje wyniki wg
+    # urzadzenia — sort()/limit() we Fluxie dzialalyby osobno w kazdej grupie
+    # (dawaloby to blok "security" nastepnie blok "environment" zamiast
+    # jednego ciagu posortowanego po czasie).
+    rekordy = _flux(q)
+    rekordy.sort(key=lambda r: r.get("_time"), reverse=True)
+    return [_przetworz_rekord(r) for r in rekordy[:limit]]
 
 
 def pobierz_raw_enc(limit: int = 100) -> list:
@@ -332,8 +336,7 @@ input[type=datetime-local]:focus{outline:none;border-color:#58a6ff}
 .login-card{background:#161b22;border:1px solid #30363d;border-radius:12px;
   padding:40px;width:360px;box-shadow:0 8px 32px rgba(0,0,0,.5)}
 .login-logo{text-align:center;margin-bottom:28px}
-.login-icon{font-size:2.6rem}
-.login-title{font-size:1.15rem;font-weight:700;color:#58a6ff;margin-top:8px}
+.login-title{font-size:1.3rem;font-weight:700;color:#58a6ff}
 .login-sub{font-size:.78rem;color:#6e7681;margin-top:4px}
 .form-grp{margin-bottom:14px}
 .form-grp label{display:block;font-size:.83rem;color:#8b949e;margin-bottom:5px}
@@ -360,15 +363,14 @@ HTML_LOGIN = """<!DOCTYPE html>
 <html lang="pl">
 <head>
 <meta charset="UTF-8">
-<title>Logowanie — IoT Security Panel</title>
+<title>Logowanie — Panel Bezpieczenstwa IoT</title>
 <style>{{ css }}</style>
 </head>
 <body>
 <div class="login-wrap">
   <div class="login-card">
     <div class="login-logo">
-      <div class="login-icon">🔐</div>
-      <div class="login-title">IoT Security Monitor</div>
+      <div class="login-title">System bezpieczenstwa IoT</div>
       <div class="login-sub">Praca magisterska — Bezpieczenstwo IoT</div>
     </div>
     {% if blad %}
@@ -410,7 +412,7 @@ HTML_ADMIN = """<!DOCTYPE html>
 
 <!-- NAGLOWEK -->
 <div class="hdr">
-  <div class="hdr-logo">🔐 IoT Security Monitor &nbsp;<span style="color:#6e7681;font-weight:400;font-size:.85rem">/ admin</span></div>
+  <div class="hdr-logo">System bezpieczenstwa IoT &nbsp;<span style="color:#6e7681;font-weight:400;font-size:.85rem">/ admin</span></div>
   <div class="hdr-right">
     <span class="badge {{ 'badge-on' if sec_online else 'badge-off' }}">
       {{ 'ONLINE' if sec_online else 'OFFLINE' }} &nbsp;Alarm
@@ -436,7 +438,7 @@ HTML_ADMIN = """<!DOCTYPE html>
 
     <!-- KARTA ANTYWLAMANIOWA -->
     <div class="card">
-      <div class="card-title">🔒 Plytka antywlamaniowa (ESP32 #1)</div>
+      <div class="card-title">Plytka antywlamaniowa (ESP32 #1)</div>
       {% if sec %}
         {% set st = sec.get('status','OFFLINE') %}
         <div class="field-row">
@@ -483,7 +485,7 @@ HTML_ADMIN = """<!DOCTYPE html>
 
     <!-- KARTA SRODOWISKOWA -->
     <div class="card">
-      <div class="card-title">🌡 Plytka srodowiskowa (ESP32 #2)</div>
+      <div class="card-title">Plytka srodowiskowa (ESP32 #2)</div>
       {% if env %}
         <div class="field-row">
           <span class="field-label">Temperatura</span>
@@ -531,7 +533,7 @@ HTML_ADMIN = """<!DOCTYPE html>
 
   <!-- PANEL ZMIANY ALGORYTMU -->
   <div class="algo-panel">
-    <span class="algo-label">⚙ Zmiana algorytmu</span>
+    <span class="algo-label">Zmiana algorytmu</span>
     <form method="POST" action="/set_algorytm" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
       <select name="board">
         <option value="antywlamaniowa">Plytka antywlamaniowa</option>
@@ -577,26 +579,27 @@ HTML_ADMIN = """<!DOCTYPE html>
           <td style="white-space:nowrap;color:#6e7681;font-size:.78rem">{{ r.czas }}</td>
           <td>
             {% if r.urzadzenie == 'security' %}
-              <span style="color:#f0883e;font-weight:700;font-size:.8rem">🔒 Security</span>
+              <span style="color:#f0883e;font-weight:700;font-size:.8rem">Antywlamaniowa</span>
             {% else %}
-              <span style="color:#388bfd;font-weight:700;font-size:.8rem">🌡 Env</span>
+              <span style="color:#388bfd;font-weight:700;font-size:.8rem">Srodowiskowa</span>
             {% endif %}
           </td>
           <td style="font-size:.8rem">
             {% if r.urzadzenie == 'security' %}
               <b style="color:{{ '#da3633' if r.status=='ALARM' else '#3fb950' }}">
                 {{ r.status }}</b>
-              &nbsp;PIR:{{ r.pir }} Drzwi:{{ r.drzwi }}
-              &nbsp;X:{{ '%.2f'|format(r.acc_x) }}
-              &nbsp;Y:{{ '%.2f'|format(r.acc_y) }}
-              &nbsp;Z:{{ '%.2f'|format(r.acc_z) }}
+              &nbsp;Ruch: {{ 'wykryto' if r.pir else 'brak' }}
+              &nbsp;Drzwi: {{ 'otwarte' if r.drzwi else 'zamkniete' }}
+              &nbsp;Przysp. X/Y/Z: {{ '%.2f'|format(r.acc_x) }} /
+              {{ '%.2f'|format(r.acc_y) }} /
+              {{ '%.2f'|format(r.acc_z) }}
             {% else %}
-              T:{{ '%.1f'|format(r.temperatura) }}°C
-              &nbsp;H:{{ '%.1f'|format(r.wilgotnosc) }}%
-              &nbsp;P:{{ '%.0f'|format(r.cisnienie) }}hPa
-              &nbsp;G:{{ '%d'|format(r.gazy) }}
-              &nbsp;L:{{ '%.0f'|format(r.swiatlo) }}lx
-              &nbsp;D:{{ r.dzwiek }}
+              Temperatura: {{ '%.1f'|format(r.temperatura) }}°C
+              &nbsp;Wilgotnosc: {{ '%.1f'|format(r.wilgotnosc) }}%
+              &nbsp;Cisnienie: {{ '%.0f'|format(r.cisnienie) }}hPa
+              &nbsp;Jakosc powietrza: {{ '%d'|format(r.gazy) }}
+              &nbsp;Swiatlo: {{ '%.0f'|format(r.swiatlo) }}lx
+              &nbsp;Dzwiek: {{ 'wykryto' if r.dzwiek else 'cisza' }}
             {% endif %}
           </td>
           <td><span class="mono">{{ r.uzyty_szyfr }}</span></td>
@@ -644,7 +647,7 @@ HTML_USER = """<!DOCTYPE html>
 </head>
 <body>
 <div class="hdr">
-  <div class="hdr-logo">🔐 IoT Security Monitor &nbsp;
+  <div class="hdr-logo">System bezpieczenstwa IoT &nbsp;
     <span style="color:#6e7681;font-weight:400;font-size:.85rem">/ uzytkownik</span>
   </div>
   <div class="hdr-right">
@@ -667,9 +670,9 @@ HTML_USER = """<!DOCTYPE html>
       <div class="raw-meta">
         <span>{{ item.czas }}</span>
         {% if item.urzadzenie == 'security' %}
-          <span class="dev-s">🔒 Antywlamaniowa</span>
+          <span class="dev-s">Antywlamaniowa</span>
         {% else %}
-          <span class="dev-e">🌡 Srodowiskowa</span>
+          <span class="dev-e">Srodowiskowa</span>
         {% endif %}
       </div>
       <div class="raw-payload">{{ item.raw_enc }}</div>
@@ -695,12 +698,12 @@ HTML_HISTORIA = """<!DOCTYPE html>
 <html lang="pl">
 <head>
 <meta charset="UTF-8">
-<title>Historia — IoT Security Panel</title>
+<title>Historia — Panel Bezpieczenstwa IoT</title>
 <style>{{ css }}</style>
 </head>
 <body>
 <div class="hdr">
-  <div class="hdr-logo">🔐 IoT Security Monitor &nbsp;
+  <div class="hdr-logo">System bezpieczenstwa IoT &nbsp;
     <span style="color:#6e7681;font-weight:400;font-size:.85rem">/ historia</span>
   </div>
   <div class="hdr-right">
@@ -716,7 +719,7 @@ HTML_HISTORIA = """<!DOCTYPE html>
 
   <!-- FILTR ZAKRESU DAT -->
   <div class="filter-bar">
-    <span style="color:#58a6ff;font-weight:600;font-size:.9rem">📅 Zakres dat</span>
+    <span style="color:#58a6ff;font-weight:600;font-size:.9rem">Zakres dat</span>
     <form method="GET" action="/historia"
           style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
       <label style="font-size:.85rem;color:#8b949e">Od</label>
@@ -754,14 +757,14 @@ HTML_HISTORIA = """<!DOCTYPE html>
           <th>Czas</th>
           <th>Plytka</th>
           <th>Status</th>
-          <th>PIR</th>
+          <th>Ruch</th>
           <th>Drzwi</th>
-          <th>Acc X/Y/Z</th>
-          <th>Temp °C</th>
-          <th>Wilg %</th>
-          <th>Cisn hPa</th>
-          <th>Gazy</th>
-          <th>Swiatlo lx</th>
+          <th>Przysp. X/Y/Z</th>
+          <th>Temperatura</th>
+          <th>Wilgotnosc</th>
+          <th>Cisnienie</th>
+          <th>Jakosc powietrza</th>
+          <th>Swiatlo</th>
           <th>Dzwiek</th>
           <th>Algorytm</th>
           <th>Hash</th>
@@ -779,14 +782,14 @@ HTML_HISTORIA = """<!DOCTYPE html>
           <td style="white-space:nowrap;color:#6e7681;font-size:.75rem">{{ r.czas }}</td>
           <td style="font-size:.78rem;font-weight:700;
             color:{{ '#f0883e' if r.urzadzenie=='security' else '#388bfd' }}">
-            {{ 'SEC' if r.urzadzenie=='security' else 'ENV' }}
+            {{ 'Antywlamaniowa' if r.urzadzenie=='security' else 'Srodowiskowa' }}
           </td>
           <td style="font-weight:700;
             color:{{ '#da3633' if r.status=='ALARM' else '#3fb950' if r.urzadzenie=='security' else '#8b949e' }}">
             {{ r.status if r.urzadzenie=='security' else '—' }}
           </td>
-          <td>{{ r.pir if r.urzadzenie=='security' else '—' }}</td>
-          <td>{{ r.drzwi if r.urzadzenie=='security' else '—' }}</td>
+          <td>{{ ('wykryto' if r.pir else 'brak') if r.urzadzenie=='security' else '—' }}</td>
+          <td>{{ ('otwarte' if r.drzwi else 'zamkniete') if r.urzadzenie=='security' else '—' }}</td>
           <td class="mono">
             {% if r.urzadzenie=='security' %}
               {{ '%.2f'|format(r.acc_x) }}&nbsp;
@@ -794,12 +797,12 @@ HTML_HISTORIA = """<!DOCTYPE html>
               {{ '%.2f'|format(r.acc_z) }}
             {% else %}—{% endif %}
           </td>
-          <td>{{ '%.1f'|format(r.temperatura) if r.urzadzenie=='environment' else '—' }}</td>
-          <td>{{ '%.1f'|format(r.wilgotnosc)  if r.urzadzenie=='environment' else '—' }}</td>
-          <td>{{ '%.0f'|format(r.cisnienie)   if r.urzadzenie=='environment' else '—' }}</td>
-          <td>{{ '%d'|format(r.gazy)           if r.urzadzenie=='environment' else '—' }}</td>
-          <td>{{ '%.0f'|format(r.swiatlo)      if r.urzadzenie=='environment' else '—' }}</td>
-          <td>{{ r.dzwiek                       if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ '%.1f°C'|format(r.temperatura) if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ '%.1f%%'|format(r.wilgotnosc)  if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ '%.0fhPa'|format(r.cisnienie)  if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ '%d'|format(r.gazy)            if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ '%.0flx'|format(r.swiatlo)     if r.urzadzenie=='environment' else '—' }}</td>
+          <td>{{ ('wykryto' if r.dzwiek else 'cisza') if r.urzadzenie=='environment' else '—' }}</td>
           <td><span class="mono">{{ r.uzyty_szyfr }}</span></td>
           <td><span class="mono" title="{{ r.data_hash }}">{{ r.data_hash[:12] }}...</span></td>
           <td>
